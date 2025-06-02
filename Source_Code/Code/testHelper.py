@@ -7,192 +7,291 @@ USER_ID_COLNAME = 'userid'
 MOVIE_ID_COLNAME = 'movieid'
 RATING_COLNAME = 'rating'
 
+# SETUP Functions
 def createdb(dbname):
+    """
+    We create a DB by connecting to the default user and database of Postgres
+    The function first checks if an existing database exists for a given name, else creates it.
+    :return:None
+    """
+    # Connect to the default database
     con = getopenconnection()
     con.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     cur = con.cursor()
-    try:
-        cur.execute(f"SELECT COUNT(*) FROM pg_catalog.pg_database WHERE datname='{dbname}'")
-        count = cur.fetchone()[0]
-        if count == 0:
-            cur.execute(f"CREATE DATABASE {dbname}")
-        else:
-            print(f'A database named "{dbname}" already exists')
-        con.commit()
-    except Exception as e:
-        con.rollback()
-        raise Exception(f"Error in createdb: {str(e)}")
-    finally:
-        cur.close()
-        con.close()
+
+    # Check if an existing database with the same name exists
+    cur.execute('SELECT COUNT(*) FROM pg_catalog.pg_database WHERE datname=\'%s\'' % (dbname,))
+    count = cur.fetchone()[0]
+    if count == 0:
+        cur.execute('CREATE DATABASE %s' % (dbname,))  # Create the database
+    else:
+        print('A database named "{0}" already exists'.format(dbname))
+
+    # Clean up
+    cur.close()
+    con.close()
 
 def delete_db(dbname):
-    con = getopenconnection(dbname='postgres')
+    con = getopenconnection(dbname = 'postgres')
     con.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     cur = con.cursor()
-    try:
-        cur.execute(f"DROP DATABASE IF EXISTS {dbname}")
-        con.commit()
-    except Exception as e:
-        con.rollback()
-        raise Exception(f"Error in delete_db: {str(e)}")
-    finally:
-        cur.close()
-        con.close()
+    cur.execute('drop database ' + dbname)
+    cur.close()
+    con.close()
+
 
 def deleteAllPublicTables(openconnection):
-    try:
-        cur = openconnection.cursor()
-        cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
-        tables = [row[0] for row in cur]
-        for tablename in tables:
-            cur.execute(f"DROP TABLE IF EXISTS {tablename} CASCADE")
-        openconnection.commit()
-    except Exception as e:
-        openconnection.rollback()
-        raise Exception(f"Error in deleteAllPublicTables: {str(e)}")
-    finally:
-        cur.close()
-
-def getopenconnection(user='postgres', password='postgres', dbname='postgres'):
-    return psycopg2.connect(
-        dbname=dbname,
-        user=user,
-        host='localhost',
-        password=password
-    )
-
-def check_completeness_disjointness(ratingstablename, prefix, num_partitions, openconnection, expected_rows):
     cur = openconnection.cursor()
-    try:
-        # Kiểm tra tính hoàn chỉnh (completeness) và tái cấu trúc (reconstruction)
-        selects = [f'SELECT * FROM {prefix}{i}' for i in range(num_partitions)]
-        cur.execute(f"SELECT COUNT(*) FROM ({' UNION ALL '.join(selects)}) AS T")
-        total_in_partitions = cur.fetchone()[0]
-        cur.execute(f"SELECT COUNT(*) FROM {ratingstablename}")
-        total_in_main = cur.fetchone()[0]
-        if total_in_partitions != expected_rows or total_in_main != expected_rows:
-            return False, f"Completeness/Reconstruction failed: Expected {expected_rows} rows, found {total_in_partitions} in partitions, {total_in_main} in main table"
+    cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
+    l = []
+    for row in cur:
+        l.append(row[0])
+    for tablename in l:
+        cur.execute("drop table if exists {0} CASCADE".format(tablename))
 
-        # Kiểm tra tính không giao thoa (disjointness)
-        for i in range(num_partitions):
-            for j in range(i + 1, num_partitions):
-                cur.execute(f"SELECT COUNT(*) FROM {prefix}{i} a JOIN {prefix}{j} b ON a.userid = b.userid AND a.movieid = b.movieid AND a.rating = b.rating")
-                overlap = cur.fetchone()[0]
-                if overlap > 0:
-                    return False, f"Disjointness failed: Overlap between {prefix}{i} and {prefix}{j}"
-        return True, None
-    finally:
-        cur.close()
+    cur.close()
 
-def testloadratings(MyAssignment, RATINGS_TABLE, INPUT_FILE_PATH, conn, ACTUAL_ROWS_IN_INPUT_FILE):
-    try:
-        MyAssignment.loadratings(RATINGS_TABLE, INPUT_FILE_PATH, conn)
-        cur = conn.cursor()
-        cur.execute(f"SELECT COUNT(*) FROM {RATINGS_TABLE}")
+def getopenconnection(user='postgres', password='1234', dbname='postgres'):
+    return psycopg2.connect("dbname='" + dbname + "' user='" + user + "' host='localhost' password='" + password + "'")
+
+
+####### Tester support
+def getCountrangepartition(ratingstablename, numberofpartitions, openconnection):
+    """
+    Get number of rows for each partition
+    :param ratingstablename:
+    :param numberofpartitions:
+    :param openconnection:
+    :return:
+    """
+    cur = openconnection.cursor()
+    countList = []
+    interval = 5.0 / numberofpartitions
+    cur.execute("select count(*) from {0} where rating >= {1} and rating <= {2}".format(ratingstablename,0, interval))
+    countList.append(int(cur.fetchone()[0]))
+
+    lowerbound = interval
+    for i in range(1, numberofpartitions):
+        cur.execute("select count(*) from {0} where rating > {1} and rating <= {2}".format(ratingstablename,
+                                                                                        lowerbound,
+                                                                                        lowerbound + interval))
+        lowerbound += interval
+        countList.append(int(cur.fetchone()[0]))
+
+    cur.close()
+    return countList
+
+
+def getCountroundrobinpartition(ratingstablename, numberofpartitions, openconnection):
+    '''
+    Get number of rows for each partition
+    :param ratingstablename:
+    :param numberofpartitions:
+    :param openconnection:
+    :return:
+    '''
+    cur = openconnection.cursor()
+    countList = []
+    for i in range(0, numberofpartitions):
+        cur.execute(
+            "select count(*) from (select *, row_number() over () from {0}) as temp where (row_number-1)%{1}= {2}".format(
+                ratingstablename, numberofpartitions, i))
+        countList.append(int(cur.fetchone()[0]))
+
+    cur.close()
+    return countList
+
+# Helpers for Tester functions
+def checkpartitioncount(cursor, expectedpartitions, prefix):
+    cursor.execute(
+        "SELECT COUNT(table_name) FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE '{0}%';".format(
+            prefix))
+    count = int(cursor.fetchone()[0])
+    if count != expectedpartitions:  raise Exception(
+        'Range partitioning not done properly. Excepted {0} table(s) but found {1} table(s)'.format(
+            expectedpartitions,
+            count))
+
+
+def totalrowsinallpartitions(cur, n, rangepartitiontableprefix, partitionstartindex):
+    selects = []
+    for i in range(partitionstartindex, n + partitionstartindex):
+        selects.append('SELECT * FROM {0}{1}'.format(rangepartitiontableprefix, i))
+    cur.execute('SELECT COUNT(*) FROM ({0}) AS T'.format(' UNION ALL '.join(selects)))
+    count = int(cur.fetchone()[0])
+    return count
+
+
+def testrangeandrobinpartitioning(n, openconnection, rangepartitiontableprefix, partitionstartindex, ACTUAL_ROWS_IN_INPUT_FILE):
+    with openconnection.cursor() as cur:
+        if not isinstance(n, int) or n < 0:
+            # Test 1: Check the number of tables created, if 'n' is invalid
+            checkpartitioncount(cur, 0, rangepartitiontableprefix)
+        else:
+            # Test 2: Check the number of tables created, if all args are correct
+            checkpartitioncount(cur, n, rangepartitiontableprefix)
+
+            # Test 3: Test Completeness by SQL UNION ALL Magic
+            count = totalrowsinallpartitions(cur, n, rangepartitiontableprefix, partitionstartindex)
+            if count < ACTUAL_ROWS_IN_INPUT_FILE: raise Exception(
+                "Completeness property of Partitioning failed. Excpected {0} rows after merging all tables, but found {1} rows".format(
+                    ACTUAL_ROWS_IN_INPUT_FILE, count))
+
+            # Test 4: Test Disjointness by SQL UNION Magic
+            count = totalrowsinallpartitions(cur, n, rangepartitiontableprefix, partitionstartindex)
+            if count > ACTUAL_ROWS_IN_INPUT_FILE: raise Exception(
+                "Dijointness property of Partitioning failed. Excpected {0} rows after merging all tables, but found {1} rows".format(
+                    ACTUAL_ROWS_IN_INPUT_FILE, count))
+
+            # Test 5: Test Reconstruction by SQL UNION Magic
+            count = totalrowsinallpartitions(cur, n, rangepartitiontableprefix, partitionstartindex)
+            if count != ACTUAL_ROWS_IN_INPUT_FILE: raise Exception(
+                "Rescontruction property of Partitioning failed. Excpected {0} rows after merging all tables, but found {1} rows".format(
+                    ACTUAL_ROWS_IN_INPUT_FILE, count))
+
+
+def testrangerobininsert(expectedtablename, itemid, openconnection, rating, userid):
+    with openconnection.cursor() as cur:
+        cur.execute(
+            'SELECT COUNT(*) FROM {0} WHERE {4} = {1} AND {5} = {2} AND {6} = {3}'.format(expectedtablename, userid,
+                                                                                        itemid, rating,
+                                                                                        USER_ID_COLNAME,
+                                                                                        MOVIE_ID_COLNAME,
+                                                                                        RATING_COLNAME))
+        count = int(cur.fetchone()[0])
+        if count != 1:  return False
+        return True
+
+def testEachRangePartition(ratingstablename, n, openconnection, rangepartitiontableprefix):
+    countList = getCountrangepartition(ratingstablename, n, openconnection)
+    cur = openconnection.cursor()
+    for i in range(0, n):
+        cur.execute("select count(*) from {0}{1}".format(rangepartitiontableprefix, i))
+        count = int(cur.fetchone()[0])
+        if count != countList[i]:
+            raise Exception("{0}{1} has {2} of rows while the correct number should be {3}".format(
+                rangepartitiontableprefix, i, count, countList[i]
+            ))
+
+def testEachRoundrobinPartition(ratingstablename, n, openconnection, roundrobinpartitiontableprefix):
+    countList = getCountroundrobinpartition(ratingstablename, n, openconnection)
+    cur = openconnection.cursor()
+    for i in range(0, n):
+        cur.execute("select count(*) from {0}{1}".format(roundrobinpartitiontableprefix, i))
         count = cur.fetchone()[0]
-        if count == ACTUAL_ROWS_IN_INPUT_FILE:
-            return [True, None]
-        else:
-            return [False, f"Expected {ACTUAL_ROWS_IN_INPUT_FILE} rows but got {count}"]
-    except Exception as e:
-        return [False, str(e)]
+        if count != countList[i]:
+            raise Exception("{0}{1} has {2} of rows while the correct number should be {3}".format(
+                roundrobinpartitiontableprefix, i, count, countList[i]
+            ))
 
-def testrangepartition(MyAssignment, RATINGS_TABLE, num_partitions, conn, min_val, max_val):
+# ##########
+
+def testloadratings(MyAssignment, ratingstablename, filepath, openconnection, rowsininpfile):
+    """
+    Tests the load ratings function
+    :param ratingstablename: Argument for function to be tested
+    :param filepath: Argument for function to be tested
+    :param openconnection: Argument for function to be tested
+    :param rowsininpfile: Number of rows in the input file provided for assertion
+    :return:Raises exception if any test fails
+    """
     try:
-        MyAssignment.rangepartition(RATINGS_TABLE, num_partitions, conn)
-        cur = conn.cursor()
-        # Kiểm tra số bảng partition
-        partition_tables = []
-        for i in range(num_partitions):
-            table_name = f"{RANGE_TABLE_PREFIX}{i}"
-            cur.execute(f"SELECT to_regclass('{table_name}')")
-            if cur.fetchone()[0] is not None:
-                partition_tables.append(table_name)
-        if len(partition_tables) != num_partitions:
-            return [False, f"Expected {num_partitions} partitions but found {len(partition_tables)}"]
+        MyAssignment.loadratings(ratingstablename,filepath,openconnection)
+        # Test 1: Count the number of rows inserted
+        with openconnection.cursor() as cur:
+            cur.execute('SELECT COUNT(*) from {0}'.format(ratingstablename))
+            count = int(cur.fetchone()[0])
+            if count != rowsininpfile:
+                raise Exception(
+                    'Expected {0} rows, but {1} rows in \'{2}\' table'.format(rowsininpfile, count, ratingstablename))
+    except Exception as e:
+        traceback.print_exc()
+        return [False, e]
+    return [True, None]
 
-        # Kiểm tra phân vùng range
-        interval = 5.0 / num_partitions
-        for i in range(num_partitions):
-            min_range = i * interval
-            max_range = (i + 1) * interval if i < num_partitions - 1 else 5.0
-            cur.execute(f"SELECT * FROM {RANGE_TABLE_PREFIX}{i}")
-            rows = cur.fetchall()
-            for row in rows:
-                rating = row[2]  # Cột rating
-                if i == 0:
-                    if not (rating >= min_range and rating <= max_range):
-                        return [False, f"Row in {RANGE_TABLE_PREFIX}{i} has rating {rating} outside range [{min_range}, {max_range}]"]
-                else:
-                    if not (rating > min_range and rating <= max_range):
-                        return [False, f"Row in {RANGE_TABLE_PREFIX}{i} has rating {rating} outside range ({min_range}, {max_range}]"]
 
-        # Kiểm tra tính hoàn chỉnh, không giao thoa, tái cấu trúc
-        result, error = check_completeness_disjointness(RATINGS_TABLE, RANGE_TABLE_PREFIX, num_partitions, conn, max_val)
-        if not result:
-            return [False, error]
+def testrangepartition(MyAssignment, ratingstablename, n, openconnection, partitionstartindex, ACTUAL_ROWS_IN_INPUT_FILE):
+    """
+    Tests the range partition function for Completness, Disjointness and Reconstruction
+    :param ratingstablename: Argument for function to be tested
+    :param n: Argument for function to be tested
+    :param openconnection: Argument for function to be tested
+    :param partitionstartindex: Indicates how the table names are indexed. Do they start as rangepart1, 2 ... or rangepart0, 1, 2...
+    :return:Raises exception if any test fails
+    """
 
+    try:
+        MyAssignment.rangepartition(ratingstablename, n, openconnection)
+        testrangeandrobinpartitioning(n, openconnection, RANGE_TABLE_PREFIX, partitionstartindex, ACTUAL_ROWS_IN_INPUT_FILE)
+        testEachRangePartition(ratingstablename, n, openconnection, RANGE_TABLE_PREFIX)
         return [True, None]
     except Exception as e:
-        return [False, str(e)]
+        traceback.print_exc()
+        return [False, e]
 
-def testrangeinsert(MyAssignment, RATINGS_TABLE, userid, movieid, rating, conn, expected_partition):
+
+def testroundrobinpartition(MyAssignment, ratingstablename, numberofpartitions, openconnection,
+                            partitionstartindex, ACTUAL_ROWS_IN_INPUT_FILE):
+    """
+    Tests the round robin partitioning for Completness, Disjointness and Reconstruction
+    :param ratingstablename: Argument for function to be tested
+    :param numberofpartitions: Argument for function to be tested
+    :param openconnection: Argument for function to be tested
+    :param robinpartitiontableprefix: This function assumes that you tables are named in an order. Eg: robinpart1, robinpart2...
+    :return:Raises exception if any test fails
+    """
     try:
-        MyAssignment.rangeinsert(RATINGS_TABLE, userid, movieid, rating, conn)
-        cur = conn.cursor()
-        table_name = f"{RANGE_TABLE_PREFIX}{expected_partition}"
-        cur.execute(f"SELECT * FROM {table_name} WHERE userid=%s AND movieid=%s AND rating=%s", (userid, movieid, rating))
-        row = cur.fetchone()
-        if row:
-            return [True, None]
-        else:
-            return [False, f"Row ({userid}, {movieid}, {rating}) not found in {table_name}"]
+        MyAssignment.roundrobinpartition(ratingstablename, numberofpartitions, openconnection)
+        testrangeandrobinpartitioning(numberofpartitions, openconnection, RROBIN_TABLE_PREFIX, partitionstartindex, ACTUAL_ROWS_IN_INPUT_FILE)
+        testEachRoundrobinPartition(ratingstablename, numberofpartitions, openconnection, RROBIN_TABLE_PREFIX)
     except Exception as e:
-        return [False, str(e)]
+        traceback.print_exc()
+        return [False, e]
+    return [True, None]
 
-def testroundrobinpartition(MyAssignment, RATINGS_TABLE, num_partitions, conn, min_val, max_val):
+def testroundrobininsert(MyAssignment, ratingstablename, userid, itemid, rating, openconnection, expectedtableindex):
+    """
+    Tests the roundrobin insert function by checking whether the tuple is inserted in he Expected table you provide
+    :param ratingstablename: Argument for function to be tested
+    :param userid: Argument for function to be tested
+    :param itemid: Argument for function to be tested
+    :param rating: Argument for function to be tested
+    :param openconnection: Argument for function to be tested
+    :param expectedtableindex: The expected table to which the record has to be saved
+    :return:Raises exception if any test fails
+    """
     try:
-        MyAssignment.roundrobinpartition(RATINGS_TABLE, num_partitions, conn)
-        cur = conn.cursor()
-        partition_tables = []
-        for i in range(num_partitions):
-            table_name = f"{RROBIN_TABLE_PREFIX}{i}"
-            cur.execute(f"SELECT to_regclass('{table_name}')")
-            if cur.fetchone()[0] is not None:
-                partition_tables.append(table_name)
-        if len(partition_tables) != num_partitions:
-            return [False, f"Expected {num_partitions} partitions but found {len(partition_tables)}"]
-
-        # Kiểm tra phân phối đều
-        counts = []
-        for i in range(num_partitions):
-            cur.execute(f"SELECT COUNT(*) FROM {RROBIN_TABLE_PREFIX}{i}")
-            counts.append(cur.fetchone()[0])
-        avg = max_val / num_partitions
-        for i, count in enumerate(counts):
-            if not (avg - 1 <= count <= avg + 1):
-                return [False, f"Uneven distribution in {RROBIN_TABLE_PREFIX}{i}: {count} rows (expected around {avg})"]
-
-        # Kiểm tra tính hoàn chỉnh, không giao thoa, tái cấu trúc
-        result, error = check_completeness_disjointness(RATINGS_TABLE, RROBIN_TABLE_PREFIX, num_partitions, conn, max_val)
-        if not result:
-            return [False, error]
-
-        return [True, None]
+        expectedtablename = RROBIN_TABLE_PREFIX + expectedtableindex
+        MyAssignment.roundrobininsert(ratingstablename, userid, itemid, rating, openconnection)
+        if not testrangerobininsert(expectedtablename, itemid, openconnection, rating, userid):
+            raise Exception(
+                'Round robin insert failed! Couldnt find ({0}, {1}, {2}) tuple in {3} table'.format(userid, itemid, rating,
+                                                                                                    expectedtablename))
     except Exception as e:
-        return [False, str(e)]
+        traceback.print_exc()
+        return [False, e]
+    return [True, None]
 
-def testroundrobininsert(MyAssignment, RATINGS_TABLE, userid, movieid, rating, conn, expected_partition):
+
+def testrangeinsert(MyAssignment, ratingstablename, userid, itemid, rating, openconnection, expectedtableindex):
+    """
+    Tests the range insert function by checking whether the tuple is inserted in he Expected table you provide
+    :param ratingstablename: Argument for function to be tested
+    :param userid: Argument for function to be tested
+    :param itemid: Argument for function to be tested
+    :param rating: Argument for function to be tested
+    :param openconnection: Argument for function to be tested
+    :param expectedtableindex: The expected table to which the record has to be saved
+    :return:Raises exception if any test fails
+    """
     try:
-        MyAssignment.roundrobininsert(RATINGS_TABLE, userid, movieid, rating, conn)
-        cur = conn.cursor()
-        table_name = f"{RROBIN_TABLE_PREFIX}{expected_partition}"
-        cur.execute(f"SELECT * FROM {table_name} WHERE userid=%s AND movieid=%s AND rating=%s", (userid, movieid, rating))
-        row = cur.fetchone()
-        if row:
-            return [True, None]
-        else:
-            return [False, f"Row ({userid}, {movieid}, {rating}) not found in {table_name}"]
+        expectedtablename = RANGE_TABLE_PREFIX + expectedtableindex
+        MyAssignment.rangeinsert(ratingstablename, userid, itemid, rating, openconnection)
+        if not testrangerobininsert(expectedtablename, itemid, openconnection, rating, userid):
+            raise Exception(
+                'Range insert failed! Couldnt find ({0}, {1}, {2}) tuple in {3} table'.format(userid, itemid, rating,
+                                                                                        expectedtablename))
     except Exception as e:
-        return [False, str(e)]
+        traceback.print_exc()
+        return [False, e]
+    return [True, None]

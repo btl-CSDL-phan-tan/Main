@@ -1,165 +1,156 @@
-# !/usr/bin/python3
+# !/usr/bin/env python3
+#
+# Interface for the assignment
+#
 
 import psycopg2
 import os
 
-DATABASE_NAME = 'test'
+DATABASE_NAME = 'dds_assgn1'
 
-def getopenconnection(user='postgres', password='postgres', dbname='test'):
-    return psycopg2.connect(
-        dbname=dbname,
-        user=user,
-        host='localhost',
-        password=password
-    )
+# Thay đổi lại mật khẩu để khớp với cấu hình của thầy. Password của nhóm là: 'postgres'
+def getopenconnection(user='postgres', password='1234', dbname='postgres'):
+    return psycopg2.connect(f"dbname='{dbname}' user='{user}' host='localhost' password='{password}'")
 
 def loadratings(ratingstablename, ratingsfilepath, openconnection):
+    """
+    Function to load data in @ratingsfilepath file to a table called @ratingstablename.
+    """
     con = openconnection
     cur = con.cursor()
-    try:
-        cur.execute(f"DROP TABLE IF EXISTS {ratingstablename};")
-        cur.execute(f"CREATE TABLE {ratingstablename} (userid INTEGER, movieid INTEGER, rating FLOAT);")
-        with open(ratingsfilepath, 'r', encoding='utf-8') as infile, open('temp_ratings.dat', 'w', encoding='utf-8') as outfile:
-            for line in infile:
-                parts = line.strip().split('::')
-                if len(parts) >= 3:
-                    outfile.write('|'.join(parts[:3]) + '\n')
-        with open('temp_ratings.dat', 'r', encoding='utf-8') as f:
-            cur.copy_from(f, ratingstablename, sep='|', columns=('userid', 'movieid', 'rating'))
-        con.commit()
-    except Exception as e:
-        con.rollback()
-        raise Exception(f"Error in loadratings: {str(e)}")
-    finally:
-        cur.close()
-        if os.path.exists('temp_ratings.dat'):
-            os.remove('temp_ratings.dat')
+    
+    # Kiểm tra tệp đầu vào tồn tại
+    if not os.path.exists(ratingsfilepath):
+        return
+    
+    # Tạo CSDL nếu chưa tồn tại
+    create_db(DATABASE_NAME)
+    
+    # Xóa bảng cũ nếu tồn tại
+    cur.execute(f"DROP TABLE IF EXISTS {ratingstablename};")
+    
+    # Tạo bảng với cột tạm và ràng buộc rating từ 0 đến 5
+    cur.execute(f"""
+        CREATE TABLE {ratingstablename} (
+            userid INTEGER,
+            extra1 CHAR(1),
+            movieid INTEGER,
+            extra2 CHAR(1),
+            rating FLOAT CHECK (rating >= 0 AND rating <= 5),
+            extra3 CHAR(1),
+            timestamp BIGINT
+        );
+    """)
+    
+    # Tải dữ liệu trực tiếp từ tệp
+    cur.copy_from(open(ratingsfilepath, 'r', encoding='utf-8'), ratingstablename, sep=':', columns=(
+        'userid', 'extra1', 'movieid', 'extra2', 'rating', 'extra3', 'timestamp'
+    ))
+    
+    # Xóa các cột không cần thiết
+    cur.execute(f"""
+        ALTER TABLE {ratingstablename}
+        DROP COLUMN extra1,
+        DROP COLUMN extra2,
+        DROP COLUMN extra3,
+        DROP COLUMN timestamp;
+    """)
+    
+    con.commit()
+    cur.close()
 
 def rangepartition(ratingstablename, numberofpartitions, openconnection):
-    if numberofpartitions <= 0:
-        return
+    """
+    Function to create partitions of main table based on range of ratings.
+    """
     con = openconnection
     cur = con.cursor()
-    try:
-        RANGE_TABLE_PREFIX = 'range_part'
-        interval = 5.0 / numberofpartitions
-        for i in range(numberofpartitions):
-            min_range = i * interval
-            max_range = (i + 1) * interval if i < numberofpartitions - 1 else 5.0
-            table_name = f"{RANGE_TABLE_PREFIX}{i}"
-            cur.execute(f"DROP TABLE IF EXISTS {table_name};")
-            cur.execute(f"CREATE TABLE {table_name} (LIKE {ratingstablename} INCLUDING ALL);")
-            if i == 0:
-                cur.execute(f"INSERT INTO {table_name} SELECT * FROM {ratingstablename} WHERE rating >= {min_range} AND rating <= {max_range};")
-            else:
-                cur.execute(f"INSERT INTO {table_name} SELECT * FROM {ratingstablename} WHERE rating > {min_range} AND rating <= {max_range};")
+    delta = 5.0 / numberofpartitions
+    RANGE_TABLE_PREFIX = 'range_part'
+    for i in range(numberofpartitions):
+        minRange = i * delta
+        maxRange = minRange + delta if i < numberofpartitions - 1 else 5.0  # Đảm bảo maxRange không vượt 5
+        table_name = f"{RANGE_TABLE_PREFIX}{i}"
+        cur.execute(f"CREATE TABLE {table_name} (userid INTEGER, movieid INTEGER, rating FLOAT);")
+        if i == 0:
+            cur.execute(f"INSERT INTO {table_name} (userid, movieid, rating) SELECT userid, movieid, rating FROM {ratingstablename} WHERE rating >= {minRange} AND rating <= {maxRange};")
+        else:
+            cur.execute(f"INSERT INTO {table_name} (userid, movieid, rating) SELECT userid, movieid, rating FROM {ratingstablename} WHERE rating > {minRange} AND rating <= {maxRange};")
         con.commit()
-    except Exception as e:
-        con.rollback()
-        raise Exception(f"Error in rangepartition: {str(e)}")
-    finally:
-        cur.close()
+    cur.close()
 
 def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
-    if numberofpartitions <= 0:
-        return
+    """
+    Function to create partitions of main table using round robin approach.
+    """
     con = openconnection
     cur = con.cursor()
-    try:
-        RROBIN_TABLE_PREFIX = 'rrobin_part'
-        cur.execute(f"SELECT * FROM {ratingstablename} ORDER BY userid, movieid;")
-        rows = cur.fetchall()
-        for i in range(numberofpartitions):
-            table_name = f"{RROBIN_TABLE_PREFIX}{i}"
-            cur.execute(f"DROP TABLE IF EXISTS {table_name};")
-            cur.execute(f"CREATE TABLE {table_name} (LIKE {ratingstablename} INCLUDING ALL);")
-        for idx, row in enumerate(rows):
-            table_name = f"{RROBIN_TABLE_PREFIX}{idx % numberofpartitions}"
-            cur.execute(f"INSERT INTO {table_name} (userid, movieid, rating) VALUES (%s, %s, %s);", row)
+    RROBIN_TABLE_PREFIX = 'rrobin_part'
+    for i in range(numberofpartitions):
+        table_name = f"{RROBIN_TABLE_PREFIX}{i}"
+        cur.execute(f"CREATE TABLE {table_name} (userid INTEGER, movieid INTEGER, rating FLOAT);")
+        cur.execute(f"INSERT INTO {table_name} (userid, movieid, rating) SELECT userid, movieid, rating FROM (SELECT userid, movieid, rating, ROW_NUMBER() OVER () AS rnum FROM {ratingstablename}) AS temp WHERE MOD(temp.rnum-1, {numberofpartitions}) = {i};")
         con.commit()
-    except Exception as e:
-        con.rollback()
-        raise Exception(f"Error in roundrobinpartition: {str(e)}")
-    finally:
-        cur.close()
+    cur.close()
 
 def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
+    """
+    Function to insert a new row into the main table and specific partition based on round robin
+    approach.
+    """
     con = openconnection
     cur = con.cursor()
-    try:
-        RROBIN_TABLE_PREFIX = 'rrobin_part'
-        cur.execute(f"INSERT INTO {ratingstablename} (userid, movieid, rating) VALUES (%s, %s, %s)", (userid, itemid, rating))
-        cur.execute(f"SELECT COUNT(*) FROM {ratingstablename};")
-        total_rows = cur.fetchone()[0]
-        n_partitions = count_partitions(RROBIN_TABLE_PREFIX, con)
-        if n_partitions == 0:
-            return
-        index = (total_rows - 1) % n_partitions
-        table_name = f"{RROBIN_TABLE_PREFIX}{index}"
-        cur.execute(f"INSERT INTO {table_name} (userid, movieid, rating) VALUES (%s, %s, %s)", (userid, itemid, rating))
-        con.commit()
-    except Exception as e:
-        con.rollback()
-        raise Exception(f"Error in roundrobininsert: {str(e)}")
-    finally:
-        cur.close()
+    RROBIN_TABLE_PREFIX = 'rrobin_part'
+    cur.execute(f"INSERT INTO {ratingstablename} (userid, movieid, rating) VALUES ({userid}, {itemid}, {rating});")
+    cur.execute(f"SELECT COUNT(*) FROM {ratingstablename};")
+    total_rows = cur.fetchone()[0]
+    numberofpartitions = count_partitions(RROBIN_TABLE_PREFIX, openconnection)
+    index = (total_rows - 1) % numberofpartitions
+    table_name = f"{RROBIN_TABLE_PREFIX}{index}"
+    cur.execute(f"INSERT INTO {table_name} (userid, movieid, rating) VALUES ({userid}, {itemid}, {rating});")
+    con.commit()
+    cur.close()
 
 def rangeinsert(ratingstablename, userid, itemid, rating, openconnection):
+    """
+    Function to insert a new row into the main table and specific partition based on range rating.
+    """
     con = openconnection
     cur = con.cursor()
-    try:
-        RANGE_TABLE_PREFIX = 'range_part'
-        cur.execute(f"INSERT INTO {ratingstablename} (userid, movieid, rating) VALUES (%s, %s, %s)", (userid, itemid, rating))
-        n_partitions = count_partitions(RANGE_TABLE_PREFIX, con)
-        if n_partitions == 0:
-            return
-        interval = 5.0 / n_partitions
-        index = 0
-        for i in range(n_partitions):
-            min_range = i * interval
-            max_range = (i + 1) * interval if i < n_partitions - 1 else 5.0
-            if i == 0:
-                if rating >= min_range and rating <= max_range:
-                    index = i
-                    break
-            else:
-                if rating > min_range and rating <= max_range:
-                    index = i
-                    break
-        table_name = f"{RANGE_TABLE_PREFIX}{index}"
-        cur.execute(f"INSERT INTO {table_name} (userid, movieid, rating) VALUES (%s, %s, %s)", (userid, itemid, rating))
-        con.commit()
-    except Exception as e:
-        con.rollback()
-        raise Exception(f"Error in rangeinsert: {str(e)}")
-    finally:
-        cur.close()
+    RANGE_TABLE_PREFIX = 'range_part'
+    numberofpartitions = count_partitions(RANGE_TABLE_PREFIX, openconnection)
+    delta = 5.0 / numberofpartitions
+    index = int(rating / delta)
+    if rating % delta == 0 and index > 0:
+        index -= 1
+    table_name = f"{RANGE_TABLE_PREFIX}{index}"
+    cur.execute(f"INSERT INTO {table_name} (userid, movieid, rating) VALUES ({userid}, {itemid}, {rating});")
+    con.commit()
+    cur.close()
 
 def create_db(dbname):
+    """
+    We create a DB by connecting to the default user and database of Postgres
+    The function first checks if an existing database exists for a given name, else creates it.
+    :return: None
+    """
     con = getopenconnection(dbname='postgres')
     con.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     cur = con.cursor()
-    try:
-        cur.execute(f"SELECT COUNT(*) FROM pg_catalog.pg_database WHERE datname='{dbname}'")
-        count = cur.fetchone()[0]
-        if count == 0:
-            cur.execute(f"CREATE DATABASE {dbname}")
-        con.commit()
-    except Exception as e:
-        con.rollback()
-        raise Exception(f"Error in create_db: {str(e)}")
-    finally:
-        cur.close()
-        con.close()
+    cur.execute(f"SELECT COUNT(*) FROM pg_catalog.pg_database WHERE datname='{dbname}'")
+    count = cur.fetchone()[0]
+    if count == 0:
+        cur.execute(f"CREATE DATABASE {dbname}")
+    cur.close()
+    con.close()
 
 def count_partitions(prefix, openconnection):
+    """
+    Function to count the number of tables which have the @prefix in their name somewhere.
+    """
     con = openconnection
     cur = con.cursor()
-    try:
-        cur.execute(f"SELECT COUNT(*) FROM pg_stat_user_tables WHERE relname LIKE '{prefix}%';")
-        count = cur.fetchone()[0]
-        return count
-    except Exception as e:
-        raise Exception(f"Error in count_partitions: {str(e)}")
-    finally:
-        cur.close()
+    cur.execute(f"SELECT COUNT(*) FROM pg_stat_user_tables WHERE relname LIKE '{prefix}%';")
+    count = cur.fetchone()[0]
+    cur.close()
+    return count
