@@ -1,0 +1,57 @@
+psql -U postgres -d dds_assgn1
+postgres
+Kết quả trả về: Kết nối thành công
+
+
+SELECT COUNT(*) FROM ratings;
+Kết quả trả về phải là 20
+
+SELECT * FROM ratings;
+Trả về các cột: userid, movieid, rating (cột timestamp bị loại bỏ)
+
+
+Xem các bảng phân vùng:
+SELECT COUNT(*) FROM range_part0;
+SELECT COUNT(*) FROM range_part1;
+SELECT COUNT(*) FROM range_part2;
+SELECT COUNT(*) FROM range_part3;
+SELECT COUNT(*) FROM range_part4;
+Tổng số bản ghi trong các bảng phân vùng phải bằng 20
+
+3 3 3 5 6  Tổng cộng = 20
+
+Kiểm tra các phân vùng:
+SELECT * FROM range_part0 WHERE rating < 0 OR rating > 1;
+SELECT * FROM range_part1 WHERE rating <= 1 OR rating > 2;
+SELECT * FROM range_part2 WHERE rating <= 2 OR rating > 3;
+SELECT * FROM range_part3 WHERE rating <= 3 OR rating > 4;
+SELECT * FROM range_part4 WHERE rating <= 4 OR rating > 5;
+Nếu không có dòng nào trả về, phân vùng đúng.
+
+
+SELECT * FROM range_part2 WHERE userid=100 AND movieid=2 AND rating=3;
+range_part2: Chứa (100, 2, 3) (vì 3 thuộc [2, 3))
+
+SELECT * FROM ratings WHERE userid=100 AND movieid=2 AND rating=3;
+
+SELECT COUNT(*) FROM range_part0;
+SELECT COUNT(*) FROM range_part1;
+SELECT COUNT(*) FROM range_part2;
+SELECT COUNT(*) FROM range_part3;
+SELECT COUNT(*) FROM range_part4;
+
+3 3 4 5 6  Tổng cộng = 21 
+
+
+SELECT COUNT(*) FROM rrobin_part0;
+SELECT COUNT(*) FROM rrobin_part1;
+SELECT COUNT(*) FROM rrobin_part2;
+SELECT COUNT(*) FROM rrobin_part3;
+SELECT COUNT(*) FROM rrobin_part4;
+
+4 4 4 4 4  Tổng cộng = 20
+
+
+SELECT * FROM rrobin_part0 WHERE userid=100 AND movieid=1 AND rating=3;
+
+SELECT * FROM ratings WHERE userid=100 AND movieid=1 AND rating=3;
